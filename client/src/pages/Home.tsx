@@ -10,7 +10,7 @@ import { initGameState, updateGame, handleMapClick, checkNPCInteraction, advance
 import {
   renderTitle, renderMap, renderPath, renderMaterials, renderNPCs,
   renderEnemies, renderPlayer, renderHUD, renderInventory, renderDialog,
-  renderBattle, renderGameOver, renderVictory, renderMapOverlay,
+  renderBattle, renderGameOver, renderVictory, renderMapOverlay, renderMinimap,
 } from '@/game/renderer';
 
 const CANVAS_W = 900;
@@ -73,6 +73,8 @@ export default function Home() {
         renderPlayer(ctx, state);
         renderMapOverlay(ctx);
         renderHUD(ctx, state);
+        // Minimapa com rota TSP — renderizado por último para ficar sobre a HUD
+        renderMinimap(ctx, state);
         if (state.activeDialog) {
           renderDialog(ctx, state, imgs.portraits);
         }

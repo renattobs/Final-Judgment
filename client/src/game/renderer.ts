@@ -4,8 +4,9 @@
 // ============================================================
 
 import { GameState, TileType, Card, Enemy } from './types';
-import { TILE_DEFS, TILE_SIZE } from './mapData';
+import { TILE_DEFS, TILE_SIZE, MAP_WIDTH, MAP_HEIGHT } from './mapData';
 import { getSortedInventory } from './engine';
+import { POIPoint, nearestNeighborTSP, routeTotalDistance } from './tsp';
 
 const CANVAS_W = 900;
 const CANVAS_H = 600;
@@ -1060,4 +1061,298 @@ export function renderVictory(ctx: CanvasRenderingContext2D): void {
   ctx.fillStyle = '#8B3A1A';
   ctx.font = '16px "Share Tech Mono", monospace';
   ctx.fillText('[R] Jogar Novamente', CANVAS_W / 2, CANVAS_H / 2 + 90);
+}
+
+// ============================================================
+// MINIMAPA — Versão reduzida do mapa com TSP
+// ============================================================
+//
+// O minimapa é exibido no canto inferior direito da tela durante
+// o jogo. Ele mostra:
+//   - Todos os tiles do mapa em escala reduzida
+//   - Posição atual do jogador (marcador dourado)
+//   - NPCs (pontos azuis/verdes/vermelhos com rótulo)
+//   - Inimigos vivos (pontos vermelhos)
+//   - Materiais não coletados (pontos coloridos)
+//   - Rota TSP (Vizinho Mais Próximo) conectando os POIs
+//
+// Dimensões do minimapa:
+//   - Largura: MINI_W = 180px
+//   - Altura:  MINI_H = 135px  (proporção 40:30 do mapa)
+//   - Posição: canto inferior direito, com margem de 8px
+// ============================================================
+
+// Dimensões e posição do minimapa
+const MINI_W = 180;
+const MINI_H = 135;
+const MINI_MARGIN = 8;
+const MINI_X = CANVAS_W - MINI_W - MINI_MARGIN;
+const MINI_Y = CANVAS_H - MINI_H - MINI_MARGIN;
+
+// Escala: converte coordenadas de tile para pixels do minimapa
+const MINI_SCALE_X = MINI_W / MAP_WIDTH;   // 180 / 40 = 4.5 px/tile
+const MINI_SCALE_Y = MINI_H / MAP_HEIGHT;  // 135 / 30 = 4.5 px/tile
+
+/**
+ * Converte coordenadas de tile para posição no minimapa (pixels no canvas).
+ */
+function tileToMini(tx: number, ty: number): { mx: number; my: number } {
+  return {
+    mx: MINI_X + tx * MINI_SCALE_X,
+    my: MINI_Y + ty * MINI_SCALE_Y,
+  };
+}
+
+/**
+ * Cores simplificadas dos tiles para o minimapa.
+ * Usa cores mais contrastantes para facilitar a leitura em escala reduzida.
+ */
+const MINI_TILE_COLORS: Record<TileType, string> = {
+  floor:     '#1a1a2e',
+  road:      '#16213e',
+  metal:     '#2a2a3e',
+  wall:      '#4a4a6a',
+  rubble:    '#5a4a3a',
+  debris:    '#1a3a2a',
+  building:  '#2e2e4e',
+  barrier:   '#6a3a2a',
+  door:      '#3a6a9a',
+  boss_zone: '#5a0a1a',
+};
+
+/**
+ * Coleta todos os Pontos de Interesse (POIs) do estado do jogo.
+ * Estes são os nós que serão usados no algoritmo TSP.
+ *
+ * Inclui:
+ *   - NPCs (não interagidos têm prioridade visual)
+ *   - Inimigos vivos
+ *   - Materiais não coletados (apenas os primeiros 8 para não poluir)
+ *   - Posição do boss (se vivo)
+ */
+function collectPOIs(state: GameState): POIPoint[] {
+  const pois: POIPoint[] = [];
+
+  // NPCs — sempre incluídos como pontos de interesse principais
+  for (const npc of state.npcs) {
+    pois.push({
+      x: npc.x + 0.5,
+      y: npc.y + 0.5,
+      label: npc.name.split(' ')[0], // Primeiro nome para brevidade
+      color: npc.color,
+      type: 'npc',
+    });
+  }
+
+  // Inimigos vivos (exceto boss — tratado separadamente)
+  for (const enemy of state.enemies) {
+    if (enemy.state === 'dead') continue;
+    if (enemy.isBoss) {
+      pois.push({
+        x: enemy.x + 0.5,
+        y: enemy.y + 0.5,
+        label: 'BOSS',
+        color: '#D32F2F',
+        type: 'boss',
+      });
+    } else {
+      pois.push({
+        x: enemy.x + 0.5,
+        y: enemy.y + 0.5,
+        label: enemy.name.split(' ')[0],
+        color: enemy.color,
+        type: 'enemy',
+      });
+    }
+  }
+
+  // Materiais não coletados — limitar a 6 para não poluir a rota TSP
+  let matCount = 0;
+  for (const mat of state.materials) {
+    if (mat.collected) continue;
+    if (matCount >= 6) break;
+    pois.push({
+      x: mat.x + 0.5,
+      y: mat.y + 0.5,
+      label: mat.type,
+      color: mat.color,
+      type: 'material',
+    });
+    matCount++;
+  }
+
+  return pois;
+}
+
+/**
+ * Renderiza o minimapa no canvas.
+ *
+ * Etapas de renderização:
+ *   1. Fundo e borda do painel do minimapa
+ *   2. Tiles do mapa em escala reduzida
+ *   3. Rota TSP (linhas conectando os POIs na ordem calculada)
+ *   4. Pontos de interesse (NPCs, inimigos, materiais)
+ *   5. Posição do jogador
+ *   6. Legenda e distância total da rota
+ */
+export function renderMinimap(ctx: CanvasRenderingContext2D, state: GameState): void {
+  ctx.save();
+
+  // ---- 1. Fundo e borda do painel ----
+  ctx.fillStyle = 'rgba(5, 5, 15, 0.88)';
+  roundRect(ctx, MINI_X - 2, MINI_Y - 18, MINI_W + 4, MINI_H + 22, 4);
+  ctx.fill();
+
+  ctx.strokeStyle = '#8B3A1A';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Título do minimapa
+  ctx.fillStyle = '#D4A017';
+  ctx.font = 'bold 9px "Share Tech Mono", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('MINIMAPA  [TSP]', MINI_X, MINI_Y - 6);
+
+  // ---- 2. Tiles do mapa em escala reduzida ----
+  const { map } = state;
+  for (let ty = 0; ty < MAP_HEIGHT; ty++) {
+    for (let tx = 0; tx < MAP_WIDTH; tx++) {
+      const tileType = map[ty][tx];
+      const { mx, my } = tileToMini(tx, ty);
+      ctx.fillStyle = MINI_TILE_COLORS[tileType];
+      ctx.fillRect(mx, my, MINI_SCALE_X + 0.5, MINI_SCALE_Y + 0.5);
+    }
+  }
+
+  // ---- 3. Rota TSP (Vizinho Mais Próximo) ----
+  //
+  // Coleta os POIs e aplica a heurística do Vizinho Mais Próximo.
+  // A rota resultante é exibida como linhas semitransparentes no minimapa,
+  // demonstrando o conceito de menor caminho aproximado entre os pontos.
+  //
+  const pois = collectPOIs(state);
+
+  if (pois.length >= 2) {
+    // Aplica a heurística TSP: começa pelo primeiro POI (índice 0)
+    const route = nearestNeighborTSP(pois, 0);
+
+    // Calcula a distância total para exibição informativa
+    const totalDist = routeTotalDistance(pois, route);
+
+    // Desenha as arestas da rota TSP
+    ctx.save();
+    ctx.strokeStyle = 'rgba(212, 160, 23, 0.55)'; // Dourado semitransparente
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+
+    for (let i = 0; i < route.length; i++) {
+      const poi = pois[route[i]];
+      const { mx, my } = tileToMini(poi.x, poi.y);
+      if (i === 0) {
+        ctx.moveTo(mx, my);
+      } else {
+        ctx.lineTo(mx, my);
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // Exibe a distância total da rota TSP abaixo do minimapa
+    ctx.fillStyle = 'rgba(212, 160, 23, 0.75)';
+    ctx.font = '8px "Share Tech Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`Rota: ${totalDist.toFixed(1)} tiles`, MINI_X + MINI_W, MINI_Y + MINI_H + 10);
+  }
+
+  // ---- 4. Pontos de Interesse (POIs) ----
+  for (const poi of pois) {
+    const { mx, my } = tileToMini(poi.x, poi.y);
+
+    if (poi.type === 'boss') {
+      // Boss: estrela vermelha maior
+      ctx.fillStyle = '#D32F2F';
+      ctx.beginPath();
+      ctx.arc(mx, my, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#FF6B6B';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    } else if (poi.type === 'npc') {
+      // NPC: círculo com borda dourada
+      ctx.fillStyle = poi.color;
+      ctx.beginPath();
+      ctx.arc(mx, my, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#D4A017';
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+    } else if (poi.type === 'enemy') {
+      // Inimigo: losango vermelho
+      ctx.fillStyle = poi.color;
+      ctx.beginPath();
+      ctx.moveTo(mx, my - 3);
+      ctx.lineTo(mx + 3, my);
+      ctx.lineTo(mx, my + 3);
+      ctx.lineTo(mx - 3, my);
+      ctx.closePath();
+      ctx.fill();
+    } else if (poi.type === 'material') {
+      // Material: quadrado colorido pequeno
+      ctx.fillStyle = poi.color;
+      ctx.fillRect(mx - 1.5, my - 1.5, 3, 3);
+    }
+  }
+
+  // ---- 5. Posição do Jogador ----
+  //
+  // O jogador é representado por um triângulo dourado pulsante
+  // apontando na direção em que está virado.
+  const { player } = state;
+  const { mx: px, my: py } = tileToMini(player.x, player.y);
+
+  // Aura pulsante ao redor do jogador
+  const pulse = 0.4 + 0.3 * Math.sin(Date.now() / 400);
+  ctx.fillStyle = `rgba(212, 160, 23, ${pulse * 0.4})`;
+  ctx.beginPath();
+  ctx.arc(px, py, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Marcador do jogador (círculo dourado sólido)
+  ctx.fillStyle = '#D4A017';
+  ctx.beginPath();
+  ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+
+  // ---- 6. Borda do minimapa (por cima dos tiles) ----
+  ctx.strokeStyle = '#3a3028';
+  ctx.lineWidth = 0.5;
+  ctx.strokeRect(MINI_X, MINI_Y, MINI_W, MINI_H);
+
+  // Legenda compacta no canto inferior esquerdo do minimapa
+  ctx.fillStyle = 'rgba(5, 5, 15, 0.75)';
+  ctx.fillRect(MINI_X, MINI_Y + MINI_H - 20, 80, 20);
+
+  ctx.font = '7px "Share Tech Mono", monospace';
+  ctx.textAlign = 'left';
+
+  // Jogador
+  ctx.fillStyle = '#D4A017';
+  ctx.fillRect(MINI_X + 3, MINI_Y + MINI_H - 17, 5, 5);
+  ctx.fillStyle = '#e8e0d0';
+  ctx.fillText('Jogador', MINI_X + 11, MINI_Y + MINI_H - 12);
+
+  // NPC
+  ctx.fillStyle = '#3498db';
+  ctx.beginPath();
+  ctx.arc(MINI_X + 5, MINI_Y + MINI_H - 7, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#e8e0d0';
+  ctx.fillText('NPC', MINI_X + 11, MINI_Y + MINI_H - 3);
+
+  ctx.restore();
 }
